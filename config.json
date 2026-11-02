@@ -1,0 +1,87 @@
+{
+  "discord_webhook_url": "YOUR_DISCORD_WEBHOOK_URL_HERE",
+  "discord_bot_token": "YOUR_DISCORD_BOT_TOKEN_HERE",
+  "discord_channel_id": 0,
+  "scan_interval_minutes": 45,
+  "min_request_delay_sec": 2.5,
+  "max_request_delay_sec": 5.5,
+  "curation_rules": {
+    "min_mrp_discount_pct": 35.0,
+    "min_history_drop_pct": 12.0,
+    "loot_drop_pct": 25.0,
+    "alert_on_first_seen_deep_discount": true,
+    "first_seen_min_mrp_discount_pct": 45.0,
+    "min_reviews_for_first_seen": 25,
+    "min_rating": 3.9,
+    "min_price_inr": 799.0,
+    "max_price_inr": 350000.0,
+    "alert_cooldown_hours": 24.0,
+    "max_alerts_per_run": 15
+  },
+  "categories": [
+    {
+      "name": "Smartphones & 5G Mobiles",
+      "enabled": true,
+      "queries": [
+        "5g smartphone",
+        "flagship smartphone",
+        "gaming smartphone 5g"
+      ]
+    },
+    {
+      "name": "Laptops & Ultrabooks",
+      "enabled": true,
+      "queries": [
+        "gaming laptop rtx",
+        "thin and light laptop",
+        "macbook air m2 m3"
+      ]
+    },
+    {
+      "name": "Headphones, TWS & Audio",
+      "enabled": true,
+      "queries": [
+        "anc wireless headphones",
+        "tws earbuds anc",
+        "dolby atmos soundbar"
+      ]
+    },
+    {
+      "name": "Monitors & 4K Smart TVs",
+      "enabled": true,
+      "queries": [
+        "144hz ips gaming monitor",
+        "4k uhd smart tv 55 inch",
+        "oled monitor"
+      ]
+    },
+    {
+      "name": "PC Components, SSDs & GPUs",
+      "enabled": true,
+      "queries": [
+        "nvme m.2 ssd 1tb 2tb",
+        "rtx graphics card",
+        "mechanical gaming keyboard"
+      ]
+    },
+    {
+      "name": "Tablets, iPads & Smartwatches",
+      "enabled": true,
+      "queries": [
+        "apple ipad tablet",
+        "android tablet",
+        "amoled smartwatch gps"
+      ]
+    },
+    {
+      "name": "Cameras & Gaming Consoles",
+      "enabled": true,
+      "queries": [
+        "mirrorless camera",
+        "action camera 4k",
+        "playstation 5 console controller"
+      ]
+    }
+  ],
+  "watchlist_urls": []
+}
