@@ -5,9 +5,9 @@ Amazon.in & Flipkart Electronics Deal Tracker Discord Bot
 Zero-cost, anti-ban electronics discount scanner and Discord bot supporting:
 1. Serverless Cron Mode (`--once`): Runs via GitHub Actions every 30 mins,
    scans all major electronics categories on Amazon.in & Flipkart using a
-   persistent Chrome TLS/cookie session (plus automatic fallback to live Indian
-   Amazon/Flipkart deal feeds if a cloud IP is CAPTCHA'd), tracks historical
-   prices in SQLite (`deals_history.db`), and posts rich embeds to Discord.
+   persistent Chrome TLS/cookie session, strictly filters out unrated or
+   0-review products, tracks historical prices in SQLite (`deals_history.db`),
+   and posts rich embeds to Discord.
 2. Interactive 24/7 Discord Bot Mode (`--bot`): Full `discord.py` bot with
    slash commands and background task loop.
 """
@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import datetime as dt
 import hashlib
-import html as html_lib
 import json
 import logging
 import os
@@ -27,7 +26,6 @@ import re
 import sqlite3
 import sys
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from http.cookiejar import CookieJar
 from pathlib import Path
@@ -67,21 +65,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-]
-
-ELECTRONICS_KEYWORDS = [
-    "phone", "iphone", "samsung", "galaxy", "oneplus", "xiaomi", "redmi", "realme",
-    "iqoo", "vivo", "oppo", "pixel", "motorola", "nothing", "poco", "laptop",
-    "macbook", "asus", "lenovo", "hp", "dell", "acer", "msi", "rtx", "ryzen",
-    "intel", "core i5", "core i7", "ssd", "nvme", "hard disk", "hdd", "pendrive",
-    "microsd", "sdcard", "ram", "graphics card", "gpu", "monitor", "lg", "benq",
-    "earbuds", "tws", "airpods", "headphones", "earphones", "neckband", "sony",
-    "jbl", "bose", "sennheiser", "boat", "boult", "noise", "soundbar", "speaker",
-    "smartwatch", "watch", "fitbit", "garmin", "ipad", "tablet", "tab", "kindle",
-    "tv", "smart tv", "oled", "qled", "4k", "projector", "camera", "gopro", "insta360",
-    "ps5", "playstation", "xbox", "nintendo", "controller", "gamepad", "mouse",
-    "keyboard", "logitech", "razer", "hyperx", "corsair", "power bank", "powerbank",
-    "charger", "gan", "adapter", "router", "wifi", "printer", "ups", "inverter",
 ]
 
 
@@ -226,6 +209,7 @@ class PriceHistoryDB:
         """
         Compare `item` against historical SQLite records and curation rules,
         update the database, and return a `DealAlert` if it qualifies.
+        Strictly rejects products without a real rating or review count.
         """
         now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
         cur = self.conn.cursor()
@@ -237,7 +221,8 @@ class PriceHistoryDB:
         loot_drop_pct = float(rules.get("loot_drop_pct", 20.0))
         min_price_inr = float(rules.get("min_price_inr", 299.0))
         max_price_inr = float(rules.get("max_price_inr", 500000.0))
-        min_rating = float(rules.get("min_rating", 3.8))
+        min_rating = float(rules.get("min_rating", 4.0))
+        min_reviews = int(rules.get("min_reviews_for_first_seen", 10))
         cooldown_hours = float(rules.get("alert_cooldown_hours", 24.0))
         alert_on_first_seen_deep_discount = bool(
             rules.get("alert_on_first_seen_deep_discount", True)
@@ -246,11 +231,16 @@ class PriceHistoryDB:
             rules.get("first_seen_min_mrp_discount_pct", 15.0)
         )
 
+        # Strict rating & review enforcement (unless manually added to Watchlist)
+        if item.category != "Watchlist":
+            if item.rating is None or item.rating < min_rating:
+                return None
+            if item.review_count < min_reviews:
+                return None
+
         if item.current_price > max_price_inr:
             return None
         if item.current_price < min_price_inr and item.mrp_price < 2000.0:
-            return None
-        if item.rating is not None and item.rating > 0 and item.rating < min_rating:
             return None
 
         alert: Optional[DealAlert] = None
@@ -289,7 +279,6 @@ class PriceHistoryDB:
             if (
                 alert_on_first_seen_deep_discount
                 and item.mrp_discount_pct >= first_seen_min_mrp_discount_pct
-                and (item.review_count >= int(rules.get("min_reviews_for_first_seen", 5)) or item.category == "Watchlist")
             ):
                 savings = max(0.0, item.mrp_price - item.current_price)
                 tier = "LOOT DEAL" if item.mrp_discount_pct >= 50.0 else "DISCOUNT DEAL"
@@ -496,14 +485,14 @@ class PriceHistoryDB:
 
 
 # ---------------------------------------------------------------------------
-# Anti-Ban HTTP Fetcher & HTML Parsers (Amazon.in + Flipkart + Fallback Feeds)
+# Anti-Ban HTTP Fetcher & HTML Parsers (Amazon.in + Flipkart)
 # ---------------------------------------------------------------------------
 
 class ElectronicsScraper:
     """
     Fetches and parses electronics listings from Amazon.in and Flipkart using a
-    persistent cookie-enabled Chrome TLS session, plus automatic fallback to
-    real-time Indian deal feeds if a cloud datacenter IP is CAPTCHA-blocked.
+    persistent cookie-enabled Chrome TLS session, strictly requiring verified
+    star ratings and customer review counts.
     """
 
     def __init__(self, min_delay_sec: float = 2.0, max_delay_sec: float = 4.5) -> None:
@@ -575,7 +564,10 @@ class ElectronicsScraper:
 
     @staticmethod
     def parse_amazon_search_html(html: str, category: str) -> List[ProductItem]:
-        """Parse Amazon.in search/category result cards into `ProductItem` objects."""
+        """
+        Parse Amazon.in search/category result cards into `ProductItem` objects.
+        Strictly skips any card that has no star rating or 0 customer reviews.
+        """
         soup = BeautifulSoup(html, "html.parser")
         cards = soup.select('div[data-component-type="s-search-result"]')
         results: List[ProductItem] = []
@@ -627,7 +619,6 @@ class ElectronicsScraper:
             )
             mrp_price = parse_inr_price(mrp_el.get_text(strip=True) if mrp_el else None)
             if not mrp_price or mrp_price < current_price:
-                # Check if explicit "(XX% off)" text is printed on the card
                 pct_match = re.search(r"\((\d{1,2})%\s*off\)", card_text, re.IGNORECASE)
                 if pct_match:
                     pct = float(pct_match.group(1))
@@ -644,19 +635,34 @@ class ElectronicsScraper:
                 else 0.0
             )
 
-            rating_el = card.select_one("span.a-icon-alt")
-            rating = None
+            # Rating & review count — MUST actually exist on the card (no fake defaults)
+            rating_el = (
+                card.select_one("span.a-icon-alt")
+                or card.select_one("i[class*='a-star'] span")
+                or card.select_one("[aria-label*='out of 5 stars']")
+            )
+            rating: Optional[float] = None
             if rating_el:
-                m = re.search(r"(\d+(?:\.\d+)?)\s*out of", rating_el.get_text())
+                r_text = rating_el.get("aria-label") or rating_el.get_text()
+                m = re.search(r"(\d+(?:\.\d+)?)\s*out of", r_text)
                 if m:
                     rating = float(m.group(1))
 
-            reviews_el = card.select_one("span.a-size-base.s-underline-text")
-            review_count = 20
+            reviews_el = (
+                card.select_one("span.a-size-base.s-underline-text")
+                or card.select_one("a[href*='#customerReviews'] span")
+                or card.select_one("[aria-label*='ratings']")
+            )
+            review_count = 0
             if reviews_el:
-                rc_digits = re.sub(r"[^\d]", "", reviews_el.get_text())
+                rv_text = reviews_el.get("aria-label") or reviews_el.get_text()
+                rc_digits = re.sub(r"[^\d]", "", rv_text)
                 if rc_digits:
                     review_count = int(rc_digits)
+
+            # Skip products with no rating or 0 reviews
+            if rating is None or review_count <= 0:
+                continue
 
             img_el = card.select_one("img.s-image")
             image_url = img_el.get("src") if img_el else None
@@ -682,7 +688,10 @@ class ElectronicsScraper:
 
     @staticmethod
     def parse_flipkart_search_html(html: str, category: str) -> List[ProductItem]:
-        """Parse Flipkart search/category result cards (both list & grid layouts)."""
+        """
+        Parse Flipkart search/category result cards (both list & grid layouts).
+        Strictly skips any card that has no star rating or 0 ratings/reviews.
+        """
         soup = BeautifulSoup(html, "html.parser")
         cards = soup.select("div[data-id]")
         results: List[ProductItem] = []
@@ -732,8 +741,8 @@ class ElectronicsScraper:
 
             current_price = price_candidates[0]
             mrp_price = max(price_candidates[:3]) if len(price_candidates) > 1 else current_price
+            card_text = card.get_text(" ", strip=True)
             if mrp_price <= current_price:
-                card_text = card.get_text(" ", strip=True)
                 pct_match = re.search(r"(\d{1,2})%\s*off", card_text, re.IGNORECASE)
                 if pct_match:
                     pct = float(pct_match.group(1))
@@ -746,17 +755,47 @@ class ElectronicsScraper:
                 else 0.0
             )
 
+            # Star rating — must actually exist on the Flipkart card
             rating_el = (
                 card.select_one("div.XQDdHH")
                 or card.select_one("div._3LWZlK")
                 or card.select_one("span[id^='productRating'] div")
             )
-            rating = None
+            rating: Optional[float] = None
             if rating_el:
-                try:
-                    rating = float(rating_el.get_text(strip=True)[:3])
-                except ValueError:
-                    rating = None
+                m_r = re.search(r"^(\d(?:\.\d)?)", rating_el.get_text(strip=True))
+                if m_r:
+                    rating = float(m_r.group(1))
+
+            # Review / rating count on Flipkart card (e.g. "(1,245)" in `span.Wphh3N` or "1,245 Ratings")
+            review_count = 0
+            rc_el = (
+                card.select_one("span.Wphh3N")
+                or card.select_one("span._2_R_DZ")
+            )
+            if rc_el:
+                rc_text = rc_el.get_text(" ", strip=True)
+                m_cnt = re.search(r"([\d,]+)\s*Ratings?", rc_text, re.IGNORECASE) or re.search(
+                    r"\(([\d,]+)\)", rc_text
+                )
+                if m_cnt:
+                    digits = re.sub(r"[^\d]", "", m_cnt.group(1))
+                    if digits:
+                        review_count = int(digits)
+
+            # Fallback regex on card text if Flipkart changes span class
+            if review_count == 0:
+                m_cnt2 = re.search(r"([\d,]+)\s*Ratings?", card_text, re.IGNORECASE) or re.search(
+                    r"\(([\d,]{2,})\)", card_text
+                )
+                if m_cnt2:
+                    digits = re.sub(r"[^\d]", "", m_cnt2.group(1))
+                    if digits:
+                        review_count = int(digits)
+
+            # Strictly skip any Flipkart listing that has no rating or 0 reviews/ratings
+            if rating is None or review_count <= 0:
+                continue
 
             img_el = card.select_one("img")
             image_url = img_el.get("src") if img_el else None
@@ -772,101 +811,11 @@ class ElectronicsScraper:
                     mrp_price=mrp_price,
                     mrp_discount_pct=round(mrp_discount_pct, 1),
                     rating=rating,
-                    review_count=50,
+                    review_count=review_count,
                     image_url=image_url,
                 )
             )
         return results
-
-    # ---- Unblockable Fallback: Live Indian Deal Feeds (DesiDime RSS/HTML) ----
-
-    def fetch_fallback_india_deals(self) -> List[ProductItem]:
-        """
-        Pulls live curated Amazon.in & Flipkart electronics deals from Indian deal feeds
-        so that even if a GitHub Actions cloud IP is CAPTCHA'd by Amazon/Flipkart directly,
-        every run still captures live electronics price drops and loot deals.
-        """
-        feed_urls = [
-            "https://www.desidime.com/deals.rss",
-            "https://www.desidime.com/new_deals.rss",
-            "https://www.desidime.com/stores/amazon-india.rss",
-            "https://www.desidime.com/stores/flipkart.rss",
-        ]
-        items: List[ProductItem] = []
-        seen_ids = set()
-
-        for feed_url in feed_urls:
-            xml_text = self.fetch_html(feed_url, referer="https://www.desidime.com/")
-            if not xml_text:
-                continue
-            try:
-                root = ET.fromstring(xml_text)
-            except ET.ParseError:
-                continue
-
-            for node in root.findall(".//item"):
-                raw_title = html_lib.unescape(node.findtext("title") or "").strip()
-                link = (node.findtext("link") or "").strip()
-                desc = html_lib.unescape(node.findtext("description") or "")
-                combined = f"{raw_title} {desc}".lower()
-
-                if not raw_title or not link:
-                    continue
-
-                # Check if electronics-related
-                if not any(kw in combined for kw in ELECTRONICS_KEYWORDS):
-                    continue
-
-                store = "Amazon.in" if "amazon" in combined or "amzn" in combined else (
-                    "Flipkart" if "flipkart" in combined or "fkrt" in combined else "Amazon.in / Flipkart"
-                )
-
-                # Extract INR price from title or description (e.g., "at Rs. 14999" or "₹14,999")
-                price_matches = re.findall(
-                    r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)", combined, re.IGNORECASE
-                )
-                prices = [parse_inr_price(p) for p in price_matches]
-                prices = [p for p in prices if p and 199.0 <= p <= 400000.0]
-                if not prices:
-                    continue
-
-                current_price = min(prices)
-                mrp_price = max(prices) if len(prices) > 1 else current_price
-
-                pct_match = re.search(r"(\d{1,2})\s*%\s*off", combined, re.IGNORECASE)
-                if pct_match and mrp_price <= current_price:
-                    pct = float(pct_match.group(1))
-                    if 5.0 <= pct <= 92.0:
-                        mrp_price = round(current_price / (1.0 - pct / 100.0))
-                elif mrp_price <= current_price:
-                    # Curated deal feeds are already vetted price drops; assume conservative 22% off MRP when MRP isn't in title
-                    mrp_price = round(current_price / 0.78)
-
-                disc_pct = ((mrp_price - current_price) / mrp_price) * 100.0
-                pid = canonical_product_id(store, link)
-                if pid in seen_ids:
-                    continue
-                seen_ids.add(pid)
-
-                img_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', desc)
-                image_url = img_match.group(1) if img_match else None
-
-                items.append(
-                    ProductItem(
-                        product_id=pid,
-                        store=store,
-                        category="Live Curated Electronics Deal",
-                        title=raw_title[:160],
-                        url=link,
-                        current_price=current_price,
-                        mrp_price=mrp_price,
-                        mrp_discount_pct=round(disc_pct, 1),
-                        rating=4.3,
-                        review_count=50,
-                        image_url=image_url,
-                    )
-                )
-        return items
 
     # ---- Direct Product URL Parser (Watchlist) ----
 
@@ -988,7 +937,7 @@ def build_discord_embed_dict(alert: DealAlert) -> Dict[str, Any]:
         fields.append(
             {
                 "name": "Rating",
-                "value": f"⭐ {p.rating:.1f} ({p.review_count:,} reviews)",
+                "value": f"⭐ {p.rating:.1f} ({p.review_count:,} ratings)",
                 "inline": True,
             }
         )
@@ -1004,7 +953,7 @@ def build_discord_embed_dict(alert: DealAlert) -> Dict[str, Any]:
         "color": alert.color_hex,
         "fields": fields,
         "footer": {
-            "text": f"ID: {p.product_id} • Real-Price Verified Deal Tracker",
+            "text": f"ID: {p.product_id} • Verified ≥4.0★ Rated Deal Tracker",
         },
         "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
@@ -1055,19 +1004,26 @@ def send_discord_webhook(webhook_url: str, alerts: List[DealAlert]) -> int:
 def build_category_urls(cat_entry: Dict[str, Any]) -> List[Tuple[str, str, str]]:
     """
     Build (store, category_name, target_url) tuples from a `config.json` category entry.
-    Includes 10%+ discount filters in the search query parameters across Amazon.in and Flipkart.
+    Pre-filters both Amazon.in (`p_72:1318476031`) and Flipkart (`4★ & above`) for
+    4-star-and-above rated electronics with 10%+ discount.
     """
     name = cat_entry["name"]
     urls: List[Tuple[str, str, str]] = []
 
     for q in cat_entry.get("queries", []):
         encoded = quote_plus(q)
-        amz_url = f"https://www.amazon.in/s?k={encoded}&i=electronics&rh=p_8%3A10-95&s=exact-aware-popularity-rank"
+        # Amazon.in: `p_8:10-95` (>=10% off) + `p_72:1318476031` (4 Stars & Up)
+        amz_url = (
+            f"https://www.amazon.in/s?k={encoded}&i=electronics"
+            f"&rh=p_8%3A10-95%2Cp_72%3A1318476031&s=exact-aware-popularity-rank"
+        )
         urls.append(("Amazon.in", name, amz_url))
 
+        # Flipkart: >=10% off + 4★ & above filter
         fk_url = (
-            f"https://www.flipkart.com/search?q={encoded}"
-            f"&otracker=search&p%5B%5D=facets.discount_range_v1%255B%255D%253D10%2525%2Bor%2Bmore"
+            f"https://www.flipkart.com/search?q={encoded}&otracker=search"
+            f"&p%5B%5D=facets.discount_range_v1%255B%255D%253D10%2525%2Bor%2Bmore"
+            f"&p%5B%5D=facets.rating%255B%255D%253D4%25E2%2598%2585%2B%2526%2Babove"
         )
         urls.append(("Flipkart", name, fk_url))
 
@@ -1087,8 +1043,8 @@ def run_scan_cycle(
     max_Categories: Optional[int] = None,
 ) -> Tuple[int, List[DealAlert]]:
     """
-    Execute one full scan cycle across all configured electronics categories,
-    live Indian deal feeds, and watchlist URLs.
+    Execute one full scan cycle across all configured electronics categories
+    and watchlist URLs.
     """
     rules = config.get("curation_rules", {})
     categories = config.get("categories", [])
@@ -1119,7 +1075,7 @@ def run_scan_cycle(
         else:
             items = scraper.parse_flipkart_search_html(html, category_name)
 
-        logger.info("Parsed %d products from %s [%s]", len(items), store, category_name)
+        logger.info("Parsed %d rated products from %s [%s]", len(items), store, category_name)
         for item in items:
             scanned_count += 1
             alert = db.evaluate_and_record(item, rules)
@@ -1127,16 +1083,6 @@ def run_scan_cycle(
                 alerts.append(alert)
 
         time.sleep(random.uniform(scraper.min_delay_sec, scraper.max_delay_sec))
-
-    # Also pull live curated Amazon.in & Flipkart electronics deals from Indian deal feeds
-    # so even if GitHub's US IP gets CAPTCHA'd on direct search pages, deals still flow!
-    fallback_items = scraper.fetch_fallback_india_deals()
-    logger.info("Fetched %d live electronics deals from Indian deal feeds.", len(fallback_items))
-    for item in fallback_items:
-        scanned_count += 1
-        alert = db.evaluate_and_record(item, rules)
-        if alert:
-            alerts.append(alert)
 
     # Scan individual Watchlist URLs
     watchlist_entries = list(db.get_watchlist())
@@ -1180,7 +1126,7 @@ def run_scan_cycle(
         logger.info("Sent %d/%d deal alerts to Discord Webhook.", sent, len(alerts))
 
     logger.info(
-        "Scan complete: %d products evaluated, %d high-value deals triggered.",
+        "Scan complete: %d rated products evaluated, %d high-value deals triggered.",
         scanned_count,
         len(alerts),
     )
