@@ -3,7 +3,7 @@ name: Amazon & Flipkart Electronics Deal Tracker (Zero-Cost Cron)
 on:
   schedule:
     # Runs automatically every 30 minutes (UTC)
-    - cron: "*/30 * * * *"
+    - cron: "13,43 * * * *"
   workflow_dispatch: # Allows manual 1-click trigger from the GitHub Actions tab
 
 permissions:
