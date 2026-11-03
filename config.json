@@ -12,7 +12,7 @@
     "alert_on_first_seen_deep_discount": true,
     "first_seen_min_mrp_discount_pct": 15.0,
     "min_reviews_for_first_seen": 5,
-    "min_rating": 3.8,
+    "min_rating": 4.0,
     "min_price_inr": 299.0,
     "max_price_inr": 350000.0,
     "alert_cooldown_hours": 24.0,
