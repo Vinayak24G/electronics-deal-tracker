@@ -27,10 +27,10 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, urljoin
 
 from bs4 import BeautifulSoup
 
@@ -94,7 +94,7 @@ class ProductItem:
 @dataclass
 class DealAlert:
     product: ProductItem
-    deal_tier: str                 # "LOOT DEAL", "ALL-TIME LOW", "PRICE DROP", "DEEP MRP DISCOUNT"
+    deal_tier: str                 # "LOOT DEAL", "ALL-TIME LOW", "BIG PRICE DROP", "DISCOUNT DEAL"
     color_hex: int                 # Discord embed color
     prev_avg_price: Optional[float]
     prev_low_price: Optional[float]
@@ -114,7 +114,6 @@ def parse_inr_price(raw_text: Optional[str]) -> Optional[float]:
     cleaned = re.sub(r"[^\d.]", "", raw_text.replace(",", ""))
     if not cleaned:
         return None
-    # Handle trailing dots or multiple decimals
     parts = [p for p in cleaned.split(".") if p]
     if not parts:
         return None
@@ -219,10 +218,10 @@ class PriceHistoryDB:
         cur.execute("SELECT * FROM products WHERE product_id = ?", (item.product_id,))
         row = cur.fetchone()
 
-        min_mrp_discount_pct = float(rules.get("min_mrp_discount_pct", 35.0))
-        min_real_drop_pct = float(rules.get("min_history_drop_pct", 12.0))
-        loot_drop_pct = float(rules.get("loot_drop_pct", 25.0))
-        min_price_inr = float(rules.get("min_price_inr", 499.0))
+        min_mrp_discount_pct = float(rules.get("min_mrp_discount_pct", 10.0))
+        min_real_drop_pct = float(rules.get("min_history_drop_pct", 5.0))
+        loot_drop_pct = float(rules.get("loot_drop_pct", 20.0))
+        min_price_inr = float(rules.get("min_price_inr", 299.0))
         max_price_inr = float(rules.get("max_price_inr", 500000.0))
         min_rating = float(rules.get("min_rating", 3.8))
         cooldown_hours = float(rules.get("alert_cooldown_hours", 24.0))
@@ -230,11 +229,13 @@ class PriceHistoryDB:
             rules.get("alert_on_first_seen_deep_discount", True)
         )
         first_seen_min_mrp_discount_pct = float(
-            rules.get("first_seen_min_mrp_discount_pct", 45.0)
+            rules.get("first_seen_min_mrp_discount_pct", 15.0)
         )
 
-        # Basic sanity filters
-        if not (min_price_inr <= item.current_price <= max_price_inr):
+        # Basic sanity filters (allow extreme mispricing on high-MRP items even below min_price_inr)
+        if item.current_price > max_price_inr:
+            return None
+        if item.current_price < min_price_inr and item.mrp_price < 2000.0:
             return None
         if item.rating is not None and item.rating > 0 and item.rating < min_rating:
             return None
@@ -273,18 +274,18 @@ class PriceHistoryDB:
                     (item.product_id, item.current_price, now_iso),
                 )
 
-            # Only alert on a brand-new product if it has a verified deep MRP discount
-            # AND reasonable review count (avoids no-name fake-MRP listings)
             if (
                 alert_on_first_seen_deep_discount
                 and item.mrp_discount_pct >= first_seen_min_mrp_discount_pct
-                and (item.review_count >= int(rules.get("min_reviews_for_first_seen", 20)) or item.category == "Watchlist")
+                and (item.review_count >= int(rules.get("min_reviews_for_first_seen", 5)) or item.category == "Watchlist")
             ):
                 savings = max(0.0, item.mrp_price - item.current_price)
+                tier = "LOOT DEAL" if item.mrp_discount_pct >= 50.0 else "DISCOUNT DEAL"
+                color = 0xE74C3C if tier == "LOOT DEAL" else 0x3498DB
                 alert = DealAlert(
                     product=item,
-                    deal_tier="DEEP MRP DISCOUNT",
-                    color_hex=0x3498DB,  # Blue
+                    deal_tier=tier,
+                    color_hex=color,
                     prev_avg_price=None,
                     prev_low_price=None,
                     real_drop_pct=0.0,
@@ -389,6 +390,14 @@ class PriceHistoryDB:
                 f"& {item.mrp_discount_pct:.0f}% off MRP"
             )
             savings = prev_avg - item.current_price
+        elif last_alerted_at is None and item.mrp_discount_pct >= first_seen_min_mrp_discount_pct:
+            tier = "DISCOUNT DEAL"
+            color = 0x3498DB  # Blue
+            reason = (
+                f"{item.mrp_discount_pct:.0f}% off MRP "
+                f"(₹{item.mrp_price:,.0f} → ₹{item.current_price:,.0f})"
+            )
+            savings = max(0.0, item.mrp_price - item.current_price)
         else:
             return None
 
@@ -537,7 +546,6 @@ class ElectronicsScraper:
             if not asin:
                 continue
 
-            # Title & link
             title_el = (
                 card.select_one("h2 a span")
                 or card.select_one("h2 span")
@@ -551,12 +559,25 @@ class ElectronicsScraper:
             href = link_el.get("href", "")
             full_url = f"https://www.amazon.in/dp/{asin}" if asin else urljoin("https://www.amazon.in", href)
 
-            # Current price
+            # Main Buy Box price
             price_el = (
                 card.select_one(".a-price:not([data-a-strike]) .a-offscreen")
                 or card.select_one(".a-price-whole")
             )
-            current_price = parse_inr_price(price_el.get_text(strip=True) if price_el else None)
+            buy_box_price = parse_inr_price(price_el.get_text(strip=True) if price_el else None)
+
+            # Also check "More Buying Choices" (cheaper third-party sellers shown on card)
+            other_seller_price = None
+            card_text = card.get_text(" ", strip=True)
+            mbc_match = re.search(r"More Buying Choices\s*₹\s*([\d,]+(?:\.\d+)?)", card_text)
+            if mbc_match:
+                other_seller_price = parse_inr_price(mbc_match.group(1))
+
+            if buy_box_price and other_seller_price:
+                current_price = min(buy_box_price, other_seller_price)
+            else:
+                current_price = buy_box_price or other_seller_price
+
             if not current_price:
                 continue
 
@@ -624,7 +645,6 @@ class ElectronicsScraper:
             if not pid:
                 continue
 
-            # Locate product anchor & title across Flipkart's list/grid class variants
             link_el = (
                 card.select_one("a[href*='/p/']")
                 or card.select_one("a.CGtC98")
@@ -653,7 +673,6 @@ class ElectronicsScraper:
             if not title:
                 continue
 
-            # Extract prices inside card: Flipkart renders current price (`₹...`) and strikethrough MRP
             price_candidates: List[float] = []
             for text_node in card.find_all(string=re.compile(r"₹\s*[\d,]+")):
                 val = parse_inr_price(str(text_node))
@@ -674,7 +693,6 @@ class ElectronicsScraper:
                 else 0.0
             )
 
-            # Rating
             rating_el = (
                 card.select_one("div.XQDdHH")
                 or card.select_one("div._3LWZlK")
@@ -687,7 +705,6 @@ class ElectronicsScraper:
                 except ValueError:
                     rating = None
 
-            # Image
             img_el = card.select_one("img")
             image_url = img_el.get("src") if img_el else None
 
@@ -702,7 +719,7 @@ class ElectronicsScraper:
                     mrp_price=mrp_price,
                     mrp_discount_pct=round(mrp_discount_pct, 1),
                     rating=rating,
-                    review_count=50,  # Default floor when Flipkart omits inline review count on grid cards
+                    review_count=50,
                     image_url=image_url,
                 )
             )
@@ -786,6 +803,7 @@ def build_discord_embed_dict(alert: DealAlert) -> Dict[str, Any]:
         "LOOT DEAL": "🔥",
         "ALL-TIME LOW": "⚡",
         "BIG PRICE DROP": "💰",
+        "DISCOUNT DEAL": "🏷️",
         "DEEP MRP DISCOUNT": "🏷️",
     }.get(alert.deal_tier, "🔔")
 
@@ -853,7 +871,7 @@ def build_discord_embed_dict(alert: DealAlert) -> Dict[str, Any]:
 
 
 def send_discord_webhook(webhook_url: str, alerts: List[DealAlert]) -> int:
-    """Send DealAlerts in batches (up to 10 embeds per request) to a Discord Webhook."""
+    """Send DealAlerts in batches (up to 5 embeds per request) to a Discord Webhook."""
     if not webhook_url or not alerts:
         return 0
 
@@ -879,7 +897,7 @@ def send_discord_webhook(webhook_url: str, alerts: List[DealAlert]) -> int:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status in (200, 204):
                     sent_count += len(batch)
-            time.sleep(1.5)  # Respect Discord webhook rate limits
+            time.sleep(1.5)
         except urllib.error.HTTPError as exc:
             logger.error("Discord webhook HTTP %s: %s", exc.code, exc.read().decode("utf-8", errors="ignore"))
         except Exception as exc:
@@ -894,22 +912,21 @@ def send_discord_webhook(webhook_url: str, alerts: List[DealAlert]) -> int:
 def build_category_urls(cat_entry: Dict[str, Any]) -> List[Tuple[str, str, str]]:
     """
     Build (store, category_name, target_url) tuples from a `config.json` category entry.
-    Includes discount filters in the search query parameters so every request targets
-    heavily discounted electronics across Amazon.in and Flipkart.
+    Includes 10%+ discount filters in the search query parameters across Amazon.in and Flipkart.
     """
     name = cat_entry["name"]
     urls: List[Tuple[str, str, str]] = []
 
     for q in cat_entry.get("queries", []):
         encoded = quote_plus(q)
-        # Amazon.in: `pct-off=25-` filters for >=25% discount in Electronics (`i=electronics`)
-        amz_url = f"https://www.amazon.in/s?k={encoded}&i=electronics&rh=p_8%3A25-95&s=exact-aware-popularity-rank"
+        # Amazon.in: `p_8:10-95` filters for >=10% discount in Electronics (`i=electronics`)
+        amz_url = f"https://www.amazon.in/s?k={encoded}&i=electronics&rh=p_8%3A10-95&s=exact-aware-popularity-rank"
         urls.append(("Amazon.in", name, amz_url))
 
-        # Flipkart: `p[]=facets.discount_range_v1%5B%5D%3D30%25+or+more` filters for >=30% off
+        # Flipkart: `p[]=facets.discount_range_v1%5B%5D%3D10%25+or+more` filters for >=10% off
         fk_url = (
             f"https://www.flipkart.com/search?q={encoded}"
-            f"&otracker=search&p%5B%5D=facets.discount_range_v1%255B%255D%253D30%2525%2Bor%2Bmore"
+            f"&otracker=search&p%5B%5D=facets.discount_range_v1%255B%255D%253D10%2525%2Bor%2Bmore"
         )
         urls.append(("Flipkart", name, fk_url))
 
@@ -942,7 +959,6 @@ def run_scan_cycle(
         if cat.get("enabled", True):
             all_targets.extend(build_category_urls(cat))
 
-    # Shuffle target order slightly so consecutive runs don't hit identical patterns
     random.shuffle(all_targets)
 
     scanned_count = 0
@@ -967,7 +983,6 @@ def run_scan_cycle(
             if alert:
                 alerts.append(alert)
 
-        # Polite randomized delay to prevent IP flagging
         time.sleep(random.uniform(scraper.min_delay_sec, scraper.max_delay_sec))
 
     # Scan individual Watchlist URLs (from both config.json and SQLite watchlist table)
@@ -1003,9 +1018,8 @@ def run_scan_cycle(
                     alerts.append(alert)
         time.sleep(random.uniform(scraper.min_delay_sec, scraper.max_delay_sec))
 
-    # Sort alerts by highest real drop percentage first, then MRP discount
     alerts.sort(key=lambda a: (a.real_drop_pct, a.product.mrp_discount_pct), reverse=True)
-    max_alerts = int(rules.get("max_alerts_per_run", 20))
+    max_alerts = int(rules.get("max_alerts_per_run", 25))
     alerts = alerts[:max_alerts]
 
     if webhook_url and alerts:
@@ -1036,7 +1050,7 @@ def run_interactive_discord_bot(config_path: Path, db_path: Path) -> None:
     bot_token = os.environ.get("DISCORD_BOT_TOKEN") or config.get("discord_bot_token", "")
     channel_id_raw = os.environ.get("DISCORD_CHANNEL_ID") or config.get("discord_channel_id", 0)
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL") or config.get("discord_webhook_url", "")
-    interval_mins = float(config.get("scan_interval_minutes", 45))
+    interval_mins = float(config.get("scan_interval_minutes", 30))
 
     if not bot_token or bot_token == "YOUR_DISCORD_BOT_TOKEN_HERE":
         logger.error(
@@ -1199,9 +1213,9 @@ def run_interactive_discord_bot(config_path: Path, db_path: Path) -> None:
                 f"**Total Price Samples:** {counts['price_samples']:,}\n"
                 f"**Custom Watchlist URLs:** {counts['watchlist_items']:,}\n"
                 f"**Scan Interval:** Every {interval_mins:.0f} minutes\n"
-                f"**Min MRP Discount:** {rules.get('min_mrp_discount_pct', 35)}%\n"
-                f"**Min Real Drop vs Avg:** {rules.get('min_history_drop_pct', 12)}%\n"
-                f"**Loot Deal Drop Threshold:** {rules.get('loot_drop_pct', 25)}%"
+                f"**Min MRP Discount:** {rules.get('min_mrp_discount_pct', 10)}%\n"
+                f"**Min Real Drop vs Avg:** {rules.get('min_history_drop_pct', 5)}%\n"
+                f"**Loot Deal Drop Threshold:** {rules.get('loot_drop_pct', 20)}%"
             ),
         )
         await interaction.response.send_message(embed=embed)
@@ -1252,7 +1266,6 @@ def main() -> None:
         run_interactive_discord_bot(args.config, args.db)
         return
 
-    # Default to `--once` serverless scan mode
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL") or config.get("discord_webhook_url", "")
     if webhook_url == "YOUR_DISCORD_WEBHOOK_URL_HERE":
         webhook_url = ""
