@@ -1,0 +1,69 @@
+name: Amazon & Flipkart Electronics Deal Tracker (Zero-Cost Cron)
+
+on:
+  schedule:
+    # Backup trigger in case the continuous loop ever stops
+    - cron: "13,43 * * * *"
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: deal-tracker-singleton
+  cancel-in-progress: false
+
+jobs:
+  scan-deals:
+    runs-on: ubuntu-latest
+    # Public GitHub repos allow up to 360 minutes (6 hours) per job for free.
+    # We run 10 scans spaced 30 minutes apart (~5 hours total) and then
+    # automatically trigger the next workflow run so it never stops 24/7.
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run 30-Minute Deal Scanner Loop (10 Cycles = 5 Hours)
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          for cycle in 1 2 3 4 5 6 7 8 9 10; do
+            echo "=================================================="
+            echo "Starting Scan Cycle $cycle of 10 at $(date -u)"
+            echo "=================================================="
+            git pull --rebase origin main || true
+            python deal_tracker_bot.py --once --config config.json --db deals_history.db
+            git add deals_history.db
+            git diff --staged --quiet || (git commit -m "chore(db): update electronics price history [skip ci]" && git push)
+
+            if [ "$cycle" -lt 10 ]; then
+              echo "Cycle $cycle complete. Sleeping 30 minutes until next scan..."
+              sleep 1800
+            fi
+          done
+
+      - name: Auto-Chain Next 5-Hour Run (24/7 Self-Trigger)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "deal_tracker.yml" || true
